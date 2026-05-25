@@ -253,7 +253,9 @@ else:
                 sel_unor = st.multiselect(f"Filter {unor_col}:", options=unique_unors)
                 if sel_unor: df = df[df[unor_col].isin(sel_unor)]
         st.write(f"Total: **{len(df):,}** baris.")
-        st.dataframe(df, use_container_width=True)
+        # Sembunyikan kolom internal sebelum ditampilkan
+        cols_to_show = [c for c in df.columns if c not in ['unor fix', 'Nilai Kontrak Clean', 'Pagu Clean', 'Nilai Kontrak AW', 'Nilai Kontrak V']]
+        st.dataframe(df[cols_to_show], use_container_width=True)
     else:
         st.warning("Data tidak ditemukan atau gagal dimuat.")
 
