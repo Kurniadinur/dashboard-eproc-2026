@@ -152,6 +152,11 @@ def process_master(data):
     def get_master_row(row):
         code = row['Kode Paket']
         pagu = kontrak = 0
+        jenis = "None"
+        progres = "Belum Ada"
+        bp2jk_val = "None"
+
+        # Pagu Priority
         if code in lookup_iemon.index:
             p = lookup_iemon.loc[code, 'Pagu Clean']
             pagu = p.iloc[0] if isinstance(p, pd.Series) else p
@@ -159,6 +164,7 @@ def process_master(data):
             p = lookup_bp2jk.loc[code, 'Pagu Clean']
             pagu = p.iloc[0] if isinstance(p, pd.Series) else p
 
+        # Kontrak Priority
         if code in lookup_bp2jk.index:
             v = lookup_bp2jk.loc[code, 'Nilai Kontrak Clean']
             kontrak = v.iloc[0] if isinstance(v, pd.Series) else v
@@ -168,9 +174,36 @@ def process_master(data):
         if kontrak == 0 and code in lookup_inaproc.index:
             v = lookup_inaproc.loc[code, 'Nilai Kontrak Clean']
             kontrak = v.iloc[0] if isinstance(v, pd.Series) else v
-        return pd.Series([pagu, kontrak])
 
-    master[['Pagu DIPA', 'Nilai Kontrak']] = master.apply(get_master_row, axis=1)
+        # Jenis Paket & BP2JK Office & Progres Logic
+        if code in lookup_bp2jk.index:
+            # Jenis
+            j = lookup_bp2jk.loc[code, 'Jenis Paket']
+            jenis = j.iloc[0] if isinstance(j, pd.Series) else j
+            # BP2JK Office
+            b = lookup_bp2jk.loc[code, 'BP2JK']
+            bp2jk_val = b.iloc[0] if isinstance(b, pd.Series) else b
+            # Progres: AR is 'Progres Paket'
+            pr = lookup_bp2jk.loc[code, 'Progres Paket']
+            progres = pr.iloc[0] if isinstance(pr, pd.Series) else pr
+
+        if (progres == "Belum Ada" or pd.isna(progres)) and code in lookup_iemon.index:
+            # Iemon Progres: U is 'Verif Unor'
+            pr = lookup_iemon.loc[code, 'Verif Unor']
+            progres = pr.iloc[0] if isinstance(pr, pd.Series) else pr
+
+        if (jenis == "None" or pd.isna(jenis)) and code in lookup_iemon.index:
+            j = lookup_iemon.loc[code, 'Jenis Paket']
+            jenis = j.iloc[0] if isinstance(j, pd.Series) else j
+
+        if (bp2jk_val == "None" or pd.isna(bp2jk_val)) and code in lookup_iemon.index:
+            b = lookup_iemon.loc[code, 'BP2JK']
+            bp2jk_val = b.iloc[0] if isinstance(b, pd.Series) else b
+
+        return pd.Series([pagu, kontrak, jenis, progres, bp2jk_val])
+
+    master[['Pagu DIPA', 'Nilai Kontrak', 'Jenis Paket', 'Progres Paket', 'BP2JK']] = master.apply(get_master_row, axis=1)
+
     info_source = pd.concat([
         data['Iemon'][['Kode Paket', 'Nama Paket', 'Unor', 'Satker']].drop_duplicates('Kode Paket') if 'Iemon' in data else pd.DataFrame(),
         data['BP2JK'][['Kode Paket', 'Nama Paket', 'Unor', 'Satker']].drop_duplicates('Kode Paket') if 'BP2JK' in data else pd.DataFrame(),
@@ -198,34 +231,101 @@ if menu == "🚀 Dashboard Utama":
     st.markdown('<p class="main-header">Master Monitoring E-Purchasing TA.2026</p>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">Konsolidasi Data Nasional & Internal Subdit Katalog</p>', unsafe_allow_html=True)
     
+    # --- GLOBAL FILTERS ---
+    with st.expander("🔍 Filter Global Dashboard", expanded=True):
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            list_unor = sorted([str(x) for x in master_df['Unor'].dropna().unique()])
+            sel_unor = st.multiselect("Filter Unor:", options=list_unor)
+        with f2:
+            list_bp2jk = sorted([str(x) for x in master_df['BP2JK'].dropna().unique()])
+            sel_bp2jk = st.multiselect("Filter BP2JK:", options=list_bp2jk)
+        with f3:
+            list_jenis = sorted([str(x) for x in master_df['Jenis Paket'].dropna().unique()])
+            sel_jenis = st.multiselect("Filter Jenis Paket:", options=list_jenis)
+
+    # Apply Filters to Master DataFrame
+    filtered_master = master_df.copy()
+    if sel_unor:
+        filtered_master = filtered_master[filtered_master['Unor'].isin(sel_unor)]
+    if sel_bp2jk:
+        filtered_master = filtered_master[filtered_master['BP2JK'].isin(sel_bp2jk)]
+    if sel_jenis:
+        filtered_master = filtered_master[filtered_master['Jenis Paket'].isin(sel_jenis)]
+
+    # Metrics Row (using filtered_master)
     m1, m2, m3, m4 = st.columns(4)
-    total_pagu, total_kontrak = master_df['Pagu DIPA'].sum(), master_df['Nilai Kontrak'].sum()
-    total_unique, sudah_kontrak = len(master_df), master_df['In Inaproc'].sum()
+    total_pagu, total_kontrak = filtered_master['Pagu DIPA'].sum(), filtered_master['Nilai Kontrak'].sum()
+    total_unique, sudah_kontrak = len(filtered_master), filtered_master['In Inaproc'].sum()
 
     with m1: st.metric("Anggaran Pagu DIPA", format_idr(total_pagu))
-    with m2: st.metric("Realisasi Kontrak", format_idr(total_kontrak), delta=f"{(total_kontrak/total_pagu*100):.1f}% dari Pagu")
+    with m2: st.metric("Realisasi Kontrak", format_idr(total_kontrak), delta=f"{(total_kontrak/total_pagu*100 if total_pagu > 0 else 0):.1f}% dari Pagu")
     with m3: st.metric("Total Paket Unik", f"{total_unique:,}")
     with m4: st.metric("Status Berkontrak", f"{sudah_kontrak:,}", delta=f"{total_unique - sudah_kontrak} Belum")
 
     tab1, tab2 = st.tabs(["📊 Analisis Grafik", "🔍 Eksplorasi Data Master"])
     
     with tab1:
+        # Row 1: Pagu and Sync Status
         col_c1, col_c2 = st.columns(2)
         with col_c1:
             st.markdown("#### 🍰 Distribusi Pagu per Unor")
-            unor_fin = master_df.groupby('Unor')['Pagu DIPA'].sum().reset_index()
+            unor_fin = filtered_master.groupby('Unor')['Pagu DIPA'].sum().reset_index()
             fig_unor = px.pie(unor_fin, values='Pagu DIPA', names='Unor', hole=0.5, color_discrete_sequence=px.colors.qualitative.Prism)
             st.plotly_chart(fig_unor, use_container_width=True)
         with col_c2:
             st.markdown("#### 📈 Paket per Sistem")
-            sync_data = {'Sistem': ['BP2JK', 'Iemon', 'Inaproc'], 'Jumlah': [master_df['In BP2JK'].sum(), master_df['In Iemon'].sum(), master_df['In Inaproc'].sum()]}
+            sync_data = {'Sistem': ['BP2JK', 'Iemon', 'Inaproc'], 'Jumlah': [filtered_master['In BP2JK'].sum(), filtered_master['In Iemon'].sum(), filtered_master['In Inaproc'].sum()]}
             fig_sync = px.bar(sync_data, x='Sistem', y='Jumlah', color='Sistem', text_auto=True, color_discrete_sequence=['#0046ad', '#0095ff', '#ff9900'])
             st.plotly_chart(fig_sync, use_container_width=True)
+
+        st.markdown("---")
+        # Row 2: Top 10 BP2JK and Jenis Paket
+        col_c3, col_c4 = st.columns(2)
+        with col_c3:
+            st.markdown("#### 🏢 Top 10 BP2JK (Jumlah Paket)")
+            top_bp2jk = filtered_master['BP2JK'].value_counts().nlargest(10).reset_index()
+            top_bp2jk.columns = ['BP2JK', 'Jumlah Paket']
+            fig_bp2jk = px.bar(top_bp2jk, x='Jumlah Paket', y='BP2JK', orientation='h', color='Jumlah Paket', color_continuous_scale='Blues')
+            fig_bp2jk.update_layout(yaxis={'categoryorder':'total ascending'})
+            st.plotly_chart(fig_bp2jk, use_container_width=True)
+        with col_c4:
+            st.markdown("#### 🏷️ Sebaran Jenis Paket")
+            jenis_data = filtered_master['Jenis Paket'].value_counts().reset_index()
+            jenis_data.columns = ['Jenis Paket', 'Jumlah']
+            fig_jenis = px.bar(jenis_data, x='Jenis Paket', y='Jumlah', color='Jenis Paket', text_auto=True, color_discrete_sequence=px.colors.qualitative.Safe)
+            st.plotly_chart(fig_jenis, use_container_width=True)
+
+        st.markdown("---")
+        # Row 3: Progres Paket with Grouping Toggle
+        st.markdown("#### 🔄 Analisis Progres Tahapan Paket")
+        
+        # UI Toggle for grouping
+        is_split = st.checkbox("Lihat rincian detail Proses Kontrak", value=False)
+        
+        progres_df = filtered_master.copy()
+        
+        if not is_split:
+            # Grouping logic
+            stages_to_group = ['Review Timlit', 'Pemasukan Penawaran', 'Proses Evaluasi']
+            progres_df['Progres Paket Display'] = progres_df['Progres Paket'].apply(
+                lambda x: 'Proses Kontrak' if x in stages_to_group else x
+            )
+        else:
+            progres_df['Progres Paket Display'] = progres_df['Progres Paket']
+
+        progres_counts = progres_df['Progres Paket Display'].value_counts().reset_index()
+        progres_counts.columns = ['Tahapan', 'Jumlah Paket']
+        
+        fig_progres = px.pie(progres_counts, values='Jumlah Paket', names='Tahapan', hole=0.5, 
+                             color_discrete_sequence=px.colors.qualitative.Pastel)
+        fig_progres.update_traces(textposition='inside', textinfo='percent+label')
+        st.plotly_chart(fig_progres, use_container_width=True)
 
     with tab2:
         st.markdown("#### 📋 Daftar Master Paket Terkonsolidasi")
         search = st.text_input("Cari Nama atau Kode Paket...", placeholder="Contoh: Jambo Aye")
-        disp = master_df.copy()
+        disp = filtered_master.copy()
         if search:
             disp = disp[disp['Nama Paket'].str.contains(search, case=False, na=False) | disp['Kode Paket'].str.contains(search, case=False, na=False)]
         
