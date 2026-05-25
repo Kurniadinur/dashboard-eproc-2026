@@ -241,16 +241,21 @@ if menu == "🚀 Dashboard Utama":
 else:
     source = menu.split(" ")[2]
     st.title(f"📄 Detail Transaksi {source}")
+    st.markdown(f"Data mentah yang ditarik langsung dari sistem {source}.")
     df = data_raw.get(source).copy() if data_raw.get(source) is not None else None
     if df is not None:
         df = df.reset_index(drop=True)
         df.index = df.index + 1
         with st.expander("🛠️ Opsi Filter"):
-            if 'Unor' in df.columns:
-                sel_unor = st.multiselect("Filter Unor:", options=sorted(df['Unor'].unique().astype(str)))
-                if sel_unor: df = df[df['Unor'].isin(sel_unor)]
+            unor_col = next((c for c in df.columns if 'UNOR' in c.upper()), None)
+            if unor_col:
+                unique_unors = sorted([str(x) for x in df[unor_col].dropna().unique()])
+                sel_unor = st.multiselect(f"Filter {unor_col}:", options=unique_unors)
+                if sel_unor: df = df[df[unor_col].isin(sel_unor)]
         st.write(f"Total: **{len(df):,}** baris.")
         st.dataframe(df, use_container_width=True)
+    else:
+        st.warning("Data tidak ditemukan atau gagal dimuat.")
 
 st.markdown("---")
 st.markdown("<center style='color: #94a3b8;'>Monitoring E-Purchasing TA.2026 | Subdit Katalog</center>", unsafe_allow_html=True)
