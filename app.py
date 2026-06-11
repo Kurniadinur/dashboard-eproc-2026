@@ -5,6 +5,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 st.set_page_config(page_title="Dashboard Monev E-Purchasing 2026", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
@@ -111,7 +112,6 @@ def normalize_status(s_str, source=None):
 
 def normalize_text(text):
     if pd.isna(text): return ""
-    import re
     # Lowercase and remove all non-alphanumeric characters for fuzzy-ish matching
     return re.sub(r'[^a-zA-Z0-9]', '', str(text).lower())
 
@@ -119,65 +119,81 @@ URL_BP2JK = "https://docs.google.com/spreadsheets/d/e/2PACX-1vR_NSdT2sPeoj9eIR15
 URL_IEMON = "https://docs.google.com/spreadsheets/d/e/2PACX-1vR_NSdT2sPeoj9eIR15xqKuveTexcqiiwc0w_pO-ofCbizx5XvknIsM5bNWUDwUBNrmmMAmMIC-pcHb/pub?gid=881219520&single=true&output=csv"
 URL_INAPROC = "https://docs.google.com/spreadsheets/d/e/2PACX-1vR_NSdT2sPeoj9eIR15xqKuveTexcqiiwc0w_pO-ofCbizx5XvknIsM5bNWUDwUBNrmmMAmMIC-pcHb/pub?gid=189207385&single=true&output=csv"
 
+def fetch_single_source(name, src):
+    try:
+        # More robust CSV reading
+        df = pd.read_csv(src, skiprows=4, quotechar='"', on_bad_lines='warn', engine='python')
+        df.columns = df.columns.str.strip()
+        
+        # 1. Flexible Column Detection
+        def find_col(keywords):
+            for c in df.columns:
+                if any(k.upper() in str(c).upper() for k in keywords): return c
+            return None
+
+        sirup_col = find_col(['SIRUP', 'KODE RUP', 'KODERUP'])
+        kp_col = find_col(['KODE PAKET', 'KODEPAKET'])
+        
+        # 2. Extract and Clean IDs
+        df['ID SIRUP'] = df[sirup_col].astype(str).str.strip().str.replace('.0','',regex=False) if sirup_col else 'MISSING'
+        df['Kode Paket'] = df[kp_col].astype(str).str.strip() if kp_col else 'MISSING'
+        
+        # Standardize missing values
+        invalid = ['nan', 'None', 'nan.0', '0', '-', '']
+        df['ID SIRUP'] = df['ID SIRUP'].apply(lambda x: 'MISSING' if str(x).strip() in invalid else str(x).strip())
+        df['Kode Paket'] = df['Kode Paket'].apply(lambda x: 'MISSING' if str(x).strip() in invalid else str(x).strip())
+
+        # 3. Create SOURCE_KEY
+        if name == "Inaproc":
+            df['nk_c'] = clean_currency_vectorized(df['Nilai Kontrak'])
+            rek_col = find_col(['REKANAN', 'NAMA REKANAN'])
+            rek_val = df[rek_col].astype(str).str.strip() if rek_col else 'None'
+            df['SOURCE_KEY'] = df['ID SIRUP'] + "_" + rek_val + "_" + df['nk_c'].astype(str)
+        else:
+            # Internal: Priority SIRUP + KP
+            def make_key(r):
+                if r['ID SIRUP'] != 'MISSING' and r['Kode Paket'] != 'MISSING': return f"{r['ID SIRUP']}_{r['Kode Paket']}"
+                if r['Kode Paket'] != 'MISSING': return f"KP_{r['Kode Paket']}"
+                if r['ID SIRUP'] != 'MISSING': return f"SIRUP_{r['ID SIRUP']}"
+                return f"RAND_{np.random.randint(1000000, 9999999)}"
+            df['SOURCE_KEY'] = df.apply(make_key, axis=1)
+        
+        # 4. Diagnostics: Capture Duplicates
+        dup_mask = df.duplicated('SOURCE_KEY', keep=False)
+        duplicates_df = df[dup_mask].sort_values('SOURCE_KEY').copy()
+        
+        # 5. Deduplicate
+        count_before = len(df)
+        df = df.drop_duplicates('SOURCE_KEY', keep='last')
+        
+        if 'Nama Paket' in df.columns:
+            df['norm_name'] = df['Nama Paket'].apply(normalize_text)
+        
+        return name, df, {"total": len(df), "before": count_before, "cols": list(df.columns)}, duplicates_df
+    except Exception as e:
+        return name, pd.DataFrame(), {"total": 0, "before": 0, "error": str(e)}, pd.DataFrame()
+
 @st.cache_data(ttl=600)
 def load_and_process_all(files=None, bypass_cache=False):
     urls = {"BP2JK": URL_BP2JK, "Iemon": URL_IEMON, "Inaproc": URL_INAPROC}
     raw, stats, duplicates = {}, {}, {}
+    
+    tasks = []
     for n, u in urls.items():
         src = files[n] if (files and files.get(n)) else u
-        try:
-            # More robust CSV reading
-            df = pd.read_csv(src, skiprows=4, quotechar='"', on_bad_lines='warn', engine='python')
-            df.columns = df.columns.str.strip()
+        tasks.append((n, src))
+    
+    # Use ThreadPoolExecutor for parallel fetching to speed up loading
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        results = list(executor.map(lambda x: fetch_single_source(*x), tasks))
+    
+    for name, df, stat, dups in results:
+        raw[name] = df
+        stats[name] = stat
+        duplicates[name] = dups
+        if "error" in stat:
+            st.error(f"Gagal memproses data {name}: {stat['error']}")
             
-            # 1. Flexible Column Detection
-            def find_col(keywords):
-                for c in df.columns:
-                    if any(k.upper() in str(c).upper() for k in keywords): return c
-                return None
-
-            sirup_col = find_col(['SIRUP', 'KODE RUP', 'KODERUP'])
-            kp_col = find_col(['KODE PAKET', 'KODEPAKET'])
-            
-            # 2. Extract and Clean IDs
-            df['ID SIRUP'] = df[sirup_col].astype(str).str.strip().str.replace('.0','',regex=False) if sirup_col else 'MISSING'
-            df['Kode Paket'] = df[kp_col].astype(str).str.strip() if kp_col else 'MISSING'
-            
-            # Standardize missing values
-            invalid = ['nan', 'None', 'nan.0', '0', '-', '']
-            df['ID SIRUP'] = df['ID SIRUP'].apply(lambda x: 'MISSING' if str(x).strip() in invalid else str(x).strip())
-            df['Kode Paket'] = df['Kode Paket'].apply(lambda x: 'MISSING' if str(x).strip() in invalid else str(x).strip())
-
-            # 3. Create SOURCE_KEY
-            if n == "Inaproc":
-                df['nk_c'] = clean_currency_vectorized(df['Nilai Kontrak'])
-                rek_col = find_col(['REKANAN', 'NAMA REKANAN'])
-                rek_val = df[rek_col].astype(str).str.strip() if rek_col else 'None'
-                df['SOURCE_KEY'] = df['ID SIRUP'] + "_" + rek_val + "_" + df['nk_c'].astype(str)
-            else:
-                # Internal: Priority SIRUP + KP
-                def make_key(r):
-                    if r['ID SIRUP'] != 'MISSING' and r['Kode Paket'] != 'MISSING': return f"{r['ID SIRUP']}_{r['Kode Paket']}"
-                    if r['Kode Paket'] != 'MISSING': return f"KP_{r['Kode Paket']}"
-                    if r['ID SIRUP'] != 'MISSING': return f"SIRUP_{r['ID SIRUP']}"
-                    return f"RAND_{np.random.randint(1000000, 9999999)}"
-                df['SOURCE_KEY'] = df.apply(make_key, axis=1)
-            
-            # 4. Diagnostics: Capture Duplicates
-            dup_mask = df.duplicated('SOURCE_KEY', keep=False)
-            duplicates[n] = df[dup_mask].sort_values('SOURCE_KEY').copy()
-            
-            # 5. Deduplicate
-            count_before = len(df)
-            df = df.drop_duplicates('SOURCE_KEY', keep='last')
-            
-            if 'Nama Paket' in df.columns:
-                df['norm_name'] = df['Nama Paket'].apply(normalize_text)
-            
-            raw[n], stats[n] = df, {"total": len(df), "before": count_before, "cols": list(df.columns)}
-        except Exception as e:
-            raw[n], stats[n] = pd.DataFrame(), {"total": 0, "before": 0, "error": str(e)}
-            duplicates[n] = pd.DataFrame()
     return raw, stats, duplicates
 
 # PART 3: MASTER CONSTRUCTION AND SIDEBAR
@@ -306,7 +322,8 @@ def clean_currency_vectorized(series):
     return pd.to_numeric(s, errors='coerce').fillna(0.0)
 
 with st.sidebar:
-    if os.path.exists("image/logo_kemenpu.png"): st.image("image/logo_kemenpu.png", use_container_width=True)
+    if os.path.exists("image/logo_kemenpu.png"): 
+        st.image("image/logo_kemenpu.png", use_container_width=True)
     st.markdown("---")
     with st.expander("🌐 Sumber Data"):
         up_bp, up_ie, up_in = st.file_uploader("BP2JK", type="csv"), st.file_uploader("Iemon", type="csv"), st.file_uploader("Inaproc", type="csv")
