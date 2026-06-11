@@ -127,6 +127,18 @@ def load_and_process_all(files=None, bypass_cache=False):
     def fetch_one(name, url):
         src = files[name] if (files and files.get(name)) else url
         try:
+            # 0. Extract Version Info from the first 5 lines
+            version_str = "Tidak Terdeteksi"
+            try:
+                # Read only the first 5 lines to find the date
+                v_df = pd.read_csv(src, nrows=5, header=None)
+                for i, row in v_df.iterrows():
+                    val = str(row[0])
+                    if "Status Data Tgl." in val:
+                        version_str = val.replace("Status Data Tgl.", "").strip()
+                        break
+            except: pass
+
             # Optimize: Use fast engine if possible
             df = pd.read_csv(src, skiprows=4, quotechar='"', on_bad_lines='warn', engine='c')
             df.columns = df.columns.str.strip()
@@ -175,9 +187,9 @@ def load_and_process_all(files=None, bypass_cache=False):
             if 'Nama Paket' in df.columns:
                 df['norm_name'] = df['Nama Paket'].apply(normalize_text)
             
-            return name, df, {"total": len(df), "before": count_before, "cols": list(df.columns)}, df_dups
+            return name, df, {"total": len(df), "before": count_before, "cols": list(df.columns), "version": version_str}, df_dups
         except Exception as e:
-            return name, pd.DataFrame(), {"total": 0, "before": 0, "error": str(e)}, pd.DataFrame()
+            return name, pd.DataFrame(), {"total": 0, "before": 0, "error": str(e), "version": "Error"}, pd.DataFrame()
 
     # Parallel execution for "Turbo Load"
     with ThreadPoolExecutor(max_workers=3) as executor:
@@ -326,10 +338,27 @@ def clean_currency_vectorized(series):
 with st.sidebar:
     if os.path.exists("image/logo_kemenpu.png"): st.image("image/logo_kemenpu.png", use_container_width=True)
     st.markdown("---")
-    with st.expander("🌐 Sumber Data"):
-        up_bp, up_ie, up_in = st.file_uploader("BP2JK", type="csv"), st.file_uploader("Iemon", type="csv"), st.file_uploader("Inaproc", type="csv")
-        bypass = st.checkbox("Bypass Cache (Force Refresh)", value=False)
-    raw_data, stats, duplicates_data = load_and_process_all({"BP2JK": up_bp, "Iemon": up_ie, "Inaproc": up_in}, bypass_cache=bypass)
+    
+    with st.expander("🌐 Sumber Data & Sinkronisasi", expanded=False):
+        up_bp, up_ie, up_in = st.file_uploader("Upload Manual BP2JK (Opsional)", type="csv"), st.file_uploader("Upload Manual Iemon (Opsional)", type="csv"), st.file_uploader("Upload Manual Inaproc (Opsional)", type="csv")
+        st.info("💡 Jika tidak upload file, data diambil otomatis dari Google Sheets.")
+        
+        # Aggressive Cache Clearing
+        if st.button("🔄 PAKSA REFRESH DATA (Hapus Cache)"):
+            st.cache_data.clear()
+            st.toast("Memori Cache Dihapus! Mengambil data terbaru...")
+            st.rerun()
+            
+    # Load Data
+    raw_data, stats, duplicates_data = load_and_process_all({"BP2JK": up_bp, "Iemon": up_ie, "Inaproc": up_in})
+    
+    # Version Diagnostics in Sidebar
+    st.markdown("### 📅 Versi Data Online")
+    for src in ["BP2JK", "Iemon", "Inaproc"]:
+        v_str = stats[src].get('version', 'Tidak Terdeteksi')
+        color = "#10b981" if "Juni" in v_str or "11" in v_str else "#f59e0b"
+        st.markdown(f"**{src}**: <span style='color:{color}; font-size:0.8rem;'>{v_str}</span>", unsafe_allow_html=True)
+    
     master_df = build_master(raw_data)
     menu = st.radio("MENU", ["🚀 Dashboard Utama", "📁 Data BP2JK", "📁 Data Iemon", "📁 Data Inaproc", "🔍 Diagnostik Data"])
 
