@@ -186,14 +186,30 @@ def build_master(raw):
         df = raw[n]
         if not df.empty:
             if n == "BP2JK":
-                p_ribuan = clean_currency_vectorized(df['Pagu RAKL (Rp Ribu)']) * 1000 if 'Pagu RAKL (Rp Ribu)' in df.columns else 0.0
-                df['p_c'] = p_ribuan
-                nk_aw = clean_currency_vectorized(df['Nilai Kontrak']) if 'Nilai Kontrak' in df.columns else 0.0
-                nk_v = clean_currency_vectorized(df['Nilai Kontrak (Rp Ribu)']) * 1000 if 'Nilai Kontrak (Rp Ribu)' in df.columns else 0.0
-                df['nk_c'] = nk_aw.where(nk_aw > 0, nk_v)
+                # Pagu Handling: Use Pagu RAKL (Rp Ribu) and convert to full IDR
+                if 'Pagu RAKL (Rp Ribu)' in df.columns:
+                    df['p_c'] = clean_currency_vectorized(df['Pagu RAKL (Rp Ribu)']) * 1000
+                elif 'Pagu Pengadaan (Rp Ribu)' in df.columns:
+                    df['p_c'] = clean_currency_vectorized(df['Pagu Pengadaan (Rp Ribu)']) * 1000
+                else:
+                    df['p_c'] = 0.0
+
+                # Nilai Kontrak Handling: Prioritize full IDR 'Nilai Kontrak' over (Rp Ribu)
+                nk_full = clean_currency_vectorized(df['Nilai Kontrak']) if 'Nilai Kontrak' in df.columns else pd.Series(0.0, index=df.index)
+                nk_ribu = clean_currency_vectorized(df['Nilai Kontrak (Rp Ribu)']) * 1000 if 'Nilai Kontrak (Rp Ribu)' in df.columns else pd.Series(0.0, index=df.index)
+                df['nk_c'] = nk_full.where(nk_full > 0, nk_ribu)
+                
             elif n == "Iemon":
                 df['p_c'] = clean_currency_vectorized(df['Pagu RAKL (Rp Ribu)']) * 1000 if 'Pagu RAKL (Rp Ribu)' in df.columns else 0.0
                 df['nk_c'] = clean_currency_vectorized(df['Nilai Kontrak (Rp Ribu)']) * 1000 if 'Nilai Kontrak (Rp Ribu)' in df.columns else 0.0
+
+    # Handle ID SIRUP Fallback in Raw Data
+    for n in ["BP2JK", "Iemon"]:
+        if not raw[n].empty:
+            df = raw[n]
+            if 'ID SIRUP' not in df.columns or (df['ID SIRUP'] == 'MISSING').all():
+                if 'Kode SIRUP' in df.columns:
+                    df['ID SIRUP'] = df['Kode SIRUP'].astype(str).str.strip().str.replace('.0','',regex=False)
 
     # 2. Build Master based on Union of Internal Data (BP2JK & Iemon)
     # We prioritize Internal Data as the foundation (The actual list of packages to be monitored)
