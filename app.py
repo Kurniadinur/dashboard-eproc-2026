@@ -5,6 +5,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 st.set_page_config(page_title="Dashboard Monev E-Purchasing 2026", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
@@ -88,11 +89,10 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # PART 2: HELPERS AND FETCH LOGIC
-def clean_currency(val):
-    if pd.isna(val) or val == "" or val == "-": return 0.0
-    c = str(val).replace('Rp','').replace('.','').replace(',','').replace(' ','').strip()
-    try: return float(c)
-    except: return 0.0
+def clean_currency_vectorized(series):
+    if series is None or series.empty: return pd.Series(0.0)
+    s = series.astype(str).str.replace('Rp','',regex=False).str.replace('.','',regex=False).str.replace(',','',regex=False).str.replace(' ','',regex=False).str.strip()
+    return pd.to_numeric(s, errors='coerce').fillna(0.0)
 
 def format_idr(val):
     if abs(val)>=1e12: return f"Rp {val/1e12:.2f} T"
@@ -111,7 +111,6 @@ def normalize_status(s_str, source=None):
 
 def normalize_text(text):
     if pd.isna(text): return ""
-    import re
     # Lowercase and remove all non-alphanumeric characters for fuzzy-ish matching
     return re.sub(r'[^a-zA-Z0-9]', '', str(text).lower())
 
@@ -300,11 +299,6 @@ def build_master(raw):
     
     return master.reset_index()
 
-def clean_currency_vectorized(series):
-    if series is None or series.empty: return pd.Series(0.0)
-    s = series.astype(str).str.replace('Rp','',regex=False).str.replace('.','',regex=False).str.replace(',','',regex=False).str.replace(' ','',regex=False).str.strip()
-    return pd.to_numeric(s, errors='coerce').fillna(0.0)
-
 with st.sidebar:
     if os.path.exists("image/logo_kemenpu.png"): st.image("image/logo_kemenpu.png", use_container_width=True)
     st.markdown("---")
@@ -313,7 +307,22 @@ with st.sidebar:
         bypass = st.checkbox("Bypass Cache (Force Refresh)", value=False)
     raw_data, stats, duplicates_data = load_and_process_all({"BP2JK": up_bp, "Iemon": up_ie, "Inaproc": up_in}, bypass_cache=bypass)
     master_df = build_master(raw_data)
+    
+    st.markdown("---")
+    debug_mode = st.checkbox("🐞 Debug Mode (Lihat Raw Data)", value=False)
+    
     menu = st.radio("MENU", ["🚀 Dashboard Utama", "📁 Data BP2JK", "📁 Data Iemon", "📁 Data Inaproc", "🔍 Diagnostik Data"])
+
+if debug_mode:
+    st.title("🐞 Debug: Raw Data Inspection")
+    for name, df in raw_data.items():
+        st.subheader(f"Raw Data: {name}")
+        if not df.empty:
+            st.write(f"Columns: {list(df.columns)}")
+            st.dataframe(df.head(10))
+        else:
+            st.error(f"Data {name} Kosong!")
+    st.markdown("---")
 
 # PART 4: DASHBOARD UTAMA
 if menu == "🚀 Dashboard Utama":
@@ -328,6 +337,11 @@ if menu == "🚀 Dashboard Utama":
     
     if master_df.empty: st.warning("⚠️ Data kosong.")
     else:
+        # Check if there are duplicates in any source
+        has_duplicates = any(not df.empty for df in duplicates_data.values())
+        if has_duplicates:
+            st.warning("⚠️ **Peringatan:** Terdeteksi data duplikat pada sumber Google Sheet. Silakan cek menu **🔍 Diagnostik Data** untuk detailnya.")
+        
         with st.expander("🔍 Filter Global", expanded=True):
             f1, f2, f3, f4 = st.columns(4)
             with f1: sel_u = st.multiselect("Filter Unor:", options=sorted(master_df['Unor'].unique()))
@@ -464,6 +478,7 @@ if menu == "🚀 Dashboard Utama":
                 }).reset_index().rename(columns={'SOURCE_KEY': 'Jumlah Paket', 'Nilai Kontrak': 'Total Kontrak'})
                 
                 rek_stats = rek_stats.sort_values('Total Kontrak', ascending=False).head(20)
+                rek_stats['Label'] = rek_stats['Total Kontrak'].apply(lambda x: f"{x/1e12:.2f} T" if x >= 1e12 else (f"{x/1e9:.2f} M" if x >= 1e9 else f"{x/1e6:.2f} J"))
                 
                 c_rek1, c_rek2 = st.columns([1, 1])
                 with c_rek1:
@@ -471,8 +486,9 @@ if menu == "🚀 Dashboard Utama":
                         rek_stats, y='Rekanan', x='Total Kontrak', 
                         orientation='h', title='Top 20 Rekanan Berdasarkan Nilai Kontrak',
                         color='Total Kontrak', color_continuous_scale='Viridis',
-                        text_auto='.2s'
+                        text='Label'
                     )
+                    fig_rek_val.update_traces(textposition='outside')
                     fig_rek_val.update_layout(yaxis={'categoryorder':'total ascending'}, showlegend=False, height=600)
                     st.plotly_chart(fig_rek_val, use_container_width=True)
                 
