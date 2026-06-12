@@ -332,10 +332,30 @@ with st.sidebar:
 if debug_mode:
     st.title("🐞 Debug: Raw Data Inspection")
     for name, df in raw_data.items():
-        st.subheader(f"Raw Data: {name}")
+        st.subheader(f"Data Source: {name}")
         if not df.empty:
-            st.write(f"Columns: {list(df.columns)}")
-            st.dataframe(df.head(10))
+            st.write(f"Total Rows: {len(df)}")
+            
+            # Show Data Types
+            with st.expander(f"📊 Column Types & Samples ({name})"):
+                types_df = pd.DataFrame({
+                    "Dtype": df.dtypes.astype(str),
+                    "Sample Value": [df[c].iloc[0] if not df[c].empty else "N/A" for c in df.columns]
+                })
+                st.table(types_df.transpose())
+
+            # Finance Deep Dive
+            st.write("💰 **Finance Cleaning Check (First 5 Rows):**")
+            fin_cols = [c for c in df.columns if any(k in c.upper() for k in ['PAGU', 'KONTRAK', 'NILAI'])]
+            if fin_cols:
+                check_df = df[fin_cols].head(5).copy()
+                for c in fin_cols:
+                    check_df[f"CLEANED_{c}"] = clean_currency_vectorized(df[c].head(5))
+                st.dataframe(check_df)
+            else:
+                st.warning("No finance-related columns detected for deep dive.")
+            
+            st.markdown("---")
         else:
             st.error(f"Data {name} Kosong!")
     st.markdown("---")
