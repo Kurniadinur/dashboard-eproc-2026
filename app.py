@@ -156,15 +156,23 @@ def build_master(raw):
         if rek_col: update_dict['Rekanan'] = df_to_merge[rek_col]
         valid_status = df_to_merge['status_norm'] != "Belum Proses"
         valid_method = df_to_merge['metode_norm'] != "Belum Info"
-        if n == "Inaproc":
-            update_dict['Progres Paket'] = df_to_merge['status_norm']
-            update_dict['Metode EP'] = df_to_merge['metode_norm'].where(valid_method)
-        else:
-            update_dict['Progres Paket'] = df_to_merge['status_norm'].where(valid_status)
-            update_dict['Metode EP'] = df_to_merge['metode_norm'].where(valid_method)
         for col, data in update_dict.items():
-            if col not in master.columns: master[col] = np.nan
+            if col not in master.columns: 
+                # Inisialisasi kolom baru dengan dtype yang sesuai dari data sumber
+                master[col] = pd.Series(index=master.index, dtype=data.dtype)
             master[col].update(data)
+        
+        # Penanganan Progres dan Metode secara khusus
+        if n == "Inaproc":
+            if 'Progres Paket' not in master.columns: master['Progres Paket'] = pd.Series(index=master.index, dtype=object)
+            if 'Metode EP' not in master.columns: master['Metode EP'] = pd.Series(index=master.index, dtype=object)
+            master['Progres Paket'].update(df_to_merge['status_norm'])
+            master['Metode EP'].update(df_to_merge['metode_norm'].where(valid_method))
+        else:
+            if 'Progres Paket' not in master.columns: master['Progres Paket'] = pd.Series(index=master.index, dtype=object)
+            if 'Metode EP' not in master.columns: master['Metode EP'] = pd.Series(index=master.index, dtype=object)
+            master['Progres Paket'].update(df_to_merge['status_norm'].where(valid_status))
+            master['Metode EP'].update(df_to_merge['metode_norm'].where(valid_method))
 
     master = master.fillna({'Pagu DIPA': 0.0, 'Nilai Kontrak': 0.0, 'Progres Paket': 'Belum Proses', 'Metode EP': 'Belum Info'}).reset_index()
     master['In BP2JK'] = master['ID SIRUP'].isin(d_proc['BP2JK']['ID SIRUP'])
