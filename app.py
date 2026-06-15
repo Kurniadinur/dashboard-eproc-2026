@@ -83,8 +83,9 @@ def load_and_process_all(files=None):
             
             dupes = pd.DataFrame()
             if sirup_col:
-                df['ID SIRUP'] = df[sirup_col].astype(str).str.strip().str.replace('.0','',regex=False)
-                invalid_ids = ['', 'nan', 'None', '0', '-', 'nan.0']
+                # Normalisasi ID SIRUP super ketat untuk cegah Double Counting
+                df['ID SIRUP'] = df[sirup_col].astype(str).str.strip().str.lower().str.replace(r'\.0+$', '', regex=True)
+                invalid_ids = ['', 'nan', 'none', '0', '-', 'nan.0', 'null']
                 
                 # Identifikasi Duplikat SEBELUM di-drop
                 mask_valid_sirup = ~df['ID SIRUP'].isin(invalid_ids)
@@ -93,7 +94,8 @@ def load_and_process_all(files=None):
                 if 'Kode Paket' in df.columns:
                     df['Kode Paket'] = df['Kode Paket'].astype(str).str.strip()
                     mask_invalid = df['ID SIRUP'].isin(invalid_ids)
-                    df['ID SIRUP'] = np.where(mask_invalid, "MISSING-" + df['Kode Paket'], df['ID SIRUP'])
+                    # Prefix missing tetap unik per paket
+                    df['ID SIRUP'] = np.where(mask_invalid, "missing-" + df['Kode Paket'].str.lower(), df['ID SIRUP'])
                 else:
                     df = df[~df['ID SIRUP'].isin(invalid_ids)]
                 
@@ -152,29 +154,51 @@ def build_master(raw):
         if df.empty: continue
         df_to_merge = df.set_index('ID SIRUP')
         rek_col = next((c for c in ['Rekanan', 'Nama Rekanan'] if c in df_to_merge.columns), None)
+        
+        # Mapping kolom
         update_dict = {map_cols[c]: df_to_merge[c] for c in map_cols if c in df_to_merge.columns}
         if rek_col: update_dict['Rekanan'] = df_to_merge[rek_col]
-        valid_status = df_to_merge['status_norm'] != "Belum Proses"
-        valid_method = df_to_merge['metode_norm'] != "Belum Info"
+        
         for col, data in update_dict.items():
-            if col not in master.columns: 
-                # Inisialisasi kolom baru dengan dtype yang sesuai dari data sumber
+            if col not in master.columns:
                 master[col] = pd.Series(index=master.index, dtype=data.dtype)
-            master[col].update(data)
+            
+            if col == 'Pagu DIPA':
+                # JANGAN UPDATE JIKA DATA BARU ADALAH 0 ATAU NAN, ambil yang terbesar
+                current_pagu = master[col].fillna(0)
+                new_pagu = data.reindex(master.index).fillna(0)
+                master[col] = np.maximum(current_pagu, new_pagu)
+            elif col == 'Nilai Kontrak':
+                # Ambil nilai kontrak terbesar (biasanya Inaproc paling update)
+                current_kontrak = master[col].fillna(0)
+                new_kontrak = data.reindex(master.index).fillna(0)
+                master[col] = np.maximum(current_kontrak, new_kontrak)
+            else:
+                # Untuk kolom teks (Nama Paket, Unor, dll), gunakan update standar
+                master[col].update(data)
         
         # Penanganan Progres dan Metode secara khusus
+        valid_status = df_to_merge['status_norm'] != "Belum Proses"
+        valid_method = df_to_merge['metode_norm'] != "Belum Info"
+        
+        if 'Progres Paket' not in master.columns: master['Progres Paket'] = pd.Series("Belum Proses", index=master.index, dtype=object)
+        if 'Metode EP' not in master.columns: master['Metode EP'] = pd.Series("Belum Info", index=master.index, dtype=object)
+        
         if n == "Inaproc":
-            if 'Progres Paket' not in master.columns: master['Progres Paket'] = pd.Series(index=master.index, dtype=object)
-            if 'Metode EP' not in master.columns: master['Metode EP'] = pd.Series(index=master.index, dtype=object)
             master['Progres Paket'].update(df_to_merge['status_norm'])
             master['Metode EP'].update(df_to_merge['metode_norm'].where(valid_method))
         else:
-            if 'Progres Paket' not in master.columns: master['Progres Paket'] = pd.Series(index=master.index, dtype=object)
-            if 'Metode EP' not in master.columns: master['Metode EP'] = pd.Series(index=master.index, dtype=object)
             master['Progres Paket'].update(df_to_merge['status_norm'].where(valid_status))
             master['Metode EP'].update(df_to_merge['metode_norm'].where(valid_method))
 
     master = master.fillna({'Pagu DIPA': 0.0, 'Nilai Kontrak': 0.0, 'Progres Paket': 'Belum Proses', 'Metode EP': 'Belum Info'}).reset_index()
+    
+    # Tambahkan kolom Status Pagu (Flagging Kontrak > Pagu)
+    # Gunakan pembulatan .round(0) agar tidak error karena selisih desimal tipis (di bawah Rp 1)
+    master['Status Pagu'] = np.where(master['Nilai Kontrak'].round(0) > master['Pagu DIPA'].round(0), "❗ MELEBIHI PAGU", "✅ AMAN")
+    # Khusus jika pagu 0 tapi ada kontrak, tandai juga
+    master['Status Pagu'] = np.where((master['Pagu DIPA'] <= 0) & (master['Nilai Kontrak'] > 0), "❗ PAGU KOSONG", master['Status Pagu'])
+    
     master['In BP2JK'] = master['ID SIRUP'].isin(d_proc['BP2JK']['ID SIRUP'])
     master['In Iemon'] = master['ID SIRUP'].isin(d_proc['Iemon']['ID SIRUP'])
     master['In Inaproc'] = master['ID SIRUP'].isin(d_proc['Inaproc']['ID SIRUP'])
@@ -265,14 +289,27 @@ if menu == "🚀 Dashboard Utama":
 
         with t2:
             dv = filtered.copy()
-            # Bersihkan ID SIRUP internal untuk tampilan (tampilkan kosong jika MISSING-)
-            mask_missing = dv['ID SIRUP'].str.contains('MISSING-', na=False)
+            # Bersihkan ID SIRUP internal untuk tampilan (tampilkan kosong jika missing-)
+            mask_missing = dv['ID SIRUP'].str.contains('missing-', na=False)
             dv.loc[mask_missing, 'ID SIRUP'] = "" 
             
+            # Tombol Download Excel
+            import io
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                dv.to_excel(writer, index=False, sheet_name='Data_Master_EP')
+            
+            st.download_button(
+                label="📥 Download Data Master (Excel)",
+                data=buffer.getvalue(),
+                file_name=f"Master_E-Purchasing_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
             dv['Pagu DIPA'] = dv['Pagu DIPA'].apply(format_idr)
             dv['Nilai Kontrak'] = dv['Nilai Kontrak'].apply(format_idr)
             dv.insert(0, 'No.', range(1, len(dv)+1))
-            st.dataframe(dv[['No.', 'ID SIRUP', 'Nama Paket', 'Unor', 'Progres Paket', 'Metode EP', 'Pagu DIPA', 'Nilai Kontrak', 'Rekanan']], use_container_width=True, height=600, hide_index=True)
+            st.dataframe(dv[['No.', 'ID SIRUP', 'Nama Paket', 'Unor', 'Progres Paket', 'Status Pagu', 'Metode EP', 'Pagu DIPA', 'Nilai Kontrak', 'Rekanan']], use_container_width=True, height=600, hide_index=True)
 
 elif menu == "🔍 Diagnostik Data":
     st.title("🔍 Diagnostik Sinkronisasi")

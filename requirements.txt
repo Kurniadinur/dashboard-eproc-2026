@@ -1,6 +1,7 @@
-streamlit
-pandas
-numpy
-plotly
-pyarrow
-requests
+streamlit==1.53.1
+pandas==2.3.1
+numpy==2.3.2
+plotly==6.5.2
+pyarrow==23.0.0
+requests==2.32.4
+xlsxwriter==3.2.9
