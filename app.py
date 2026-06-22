@@ -1,351 +1,447 @@
-# PART 1: IMPORTS AND CSS
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import os
-from concurrent.futures import ThreadPoolExecutor
+import io
+import datetime
+from utils import format_idr, generate_rekap_table, render_rekap_html
+from data_manager import load_and_process_all, build_master
+from styles import apply_custom_css, get_header_html
 
+# CONFIGURATION
 st.set_page_config(page_title="Dashboard Monev E-Purchasing 2026", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
-st.markdown("""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
-    .stApp { background-color: #f1f5f9; font-family: 'Inter', sans-serif; }
-    .block-container { max-width: 98% !important; padding-left: 1rem !important; padding-right: 1rem !important; }
-    .header-container {
-        background: linear-gradient(90deg, #1e3a8a 0%, #3b82f6 100%);
-        padding: 2rem; border-radius: 15px; margin-bottom: 2rem; color: white;
-        box-shadow: 0 4px 15px rgba(30, 58, 138, 0.2); display: flex; flex-direction: column; gap: 0.5rem;
-    }
-    .header-text h1 { margin: 0; font-size: clamp(1.2rem, 4vw, 2rem) !important; font-weight: 800; letter-spacing: -0.5px; }
-    .header-text p { margin: 0; font-size: clamp(0.8rem, 2vw, 1rem); opacity: 0.9; }
-    div[data-testid="metric-container"] {
-        background-color: white; padding: 1.2rem !important; border-radius: 12px !important;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.08) !important; border-bottom: 5px solid #FFCC00 !important;
-    }
-    div[data-testid="stMetricValue"] { color: #1e3a8a !important; font-size: clamp(1.8rem, 5vw, 2.8rem) !important; font-weight: 800 !important; line-height: 1.1; }
-    div[data-testid="stMetricLabel"] { font-size: 0.9rem !important; text-transform: uppercase; font-weight: 700; color: #64748b !important; letter-spacing: 0.5px; }
-    section[data-testid="stSidebar"] { background-color: #ffffff; border-right: 1px solid #e2e8f0; }
-    .chart-title { color: #1e3a8a; font-weight: 700; margin-bottom: 1.5rem; border-left: 5px solid #FFCC00; padding-left: 15px; font-size: clamp(1rem, 2vw, 1.2rem); }
-    .stDataFrame { border: 1px solid #e2e8f0; border-radius: 12px; }
-    </style>
-    """, unsafe_allow_html=True)
+# APPLY STYLES
+apply_custom_css()
 
-# PART 2: HELPERS AND FETCH LOGIC
-def clean_currency_vectorized(series):
-    if series is None or series.empty: return pd.Series(0.0)
-    s = series.astype(str).str.replace('Rp','',regex=False).str.replace('.','',regex=False).str.replace(',','',regex=False).str.replace(' ','',regex=False).str.strip()
-    return pd.to_numeric(s, errors='coerce').fillna(0.0)
-
-def format_idr(val):
-    if abs(val)>=1e12: return f"Rp {val/1e12:.2f} T"
-    elif abs(val)>=1e9: return f"Rp {val/1e9:.2f} M"
-    else: return f"Rp {val:,.0f}"
-
-def normalize_status_vectorized(series, source=None):
-    s = series.astype(str).str.upper()
-    res = pd.Series("Belum Proses", index=series.index)
-    
-    cond_terkontrak = s.str.contains('TERKONTRAK|SELESAI KONTRAK', na=False)
-    cond_batal = s.str.contains('BATAL', na=False)
-    
-    if source == 'BP2JK':
-        cond_persiapan = s.str.contains('PERSIAPAN TERKONTRAK|PROSES KONTRAK', na=False)
-        cond_proses = s.str.contains('PEMASUKAN PENAWARAN|PROSES EVALUASI|REVIEW TIMLIT|PROSES PENETAPAN PEMENANG', na=False)
-    else:
-        cond_persiapan = s.str.contains('PERSIAPAN TERKONTRAK', na=False)
-        cond_proses = s.str.contains('PEMASUKAN PENAWARAN|PROSES EVALUASI|REVIEW TIMLIT|PROSES PENETAPAN PEMENANG|PROSES KONTRAK', na=False)
-
-    res = np.where(cond_terkontrak, "Terkontrak",
-          np.where(cond_batal, "Batal",
-          np.where(cond_persiapan, "Persiapan Terkontrak",
-          np.where(cond_proses, "Proses E-Purchasing", "Belum Proses"))))
-    
-    res[series.isna() | (s == "") | (s == "NONE") | (s == "NAN")] = "Belum Proses"
-    return res
-
-URL_BP2JK = "https://docs.google.com/spreadsheets/d/e/2PACX-1vR_NSdT2sPeoj9eIR15xqKuveTexcqiiwc0w_pO-ofCbizx5XvknIsM5bNWUDwUBNrmmMAmMIC-pcHb/pub?gid=1807383381&single=true&output=csv"
-URL_IEMON = "https://docs.google.com/spreadsheets/d/e/2PACX-1vR_NSdT2sPeoj9eIR15xqKuveTexcqiiwc0w_pO-ofCbizx5XvknIsM5bNWUDwUBNrmmMAmMIC-pcHb/pub?gid=881219520&single=true&output=csv"
-URL_INAPROC = "https://docs.google.com/spreadsheets/d/e/2PACX-1vR_NSdT2sPeoj9eIR15xqKuveTexcqiiwc0w_pO-ofCbizx5XvknIsM5bNWUDwUBNrmmMAmMIC-pcHb/pub?gid=189207385&single=true&output=csv"
-
+# DATA LOADING (SHARED ACROSS PAGES)
 @st.cache_data(ttl=600)
-def load_and_process_all(files=None):
-    urls = {"BP2JK": URL_BP2JK, "Iemon": URL_IEMON, "Inaproc": URL_INAPROC}
-    
-    def process_source(name, url):
-        src = files[name] if (files and files.get(name)) else url
-        try:
-            df = pd.read_csv(src, skiprows=4)
-            df.columns = df.columns.str.strip()
-            sirup_col = next((c for c in df.columns if 'SIRUP' in c.upper() or 'KODE RUP' in c.upper()), None)
-            
-            dupes = pd.DataFrame()
-            if sirup_col:
-                # Normalisasi ID SIRUP super ketat untuk cegah Double Counting
-                df['ID SIRUP'] = df[sirup_col].astype(str).str.strip().str.lower().str.replace(r'\.0+$', '', regex=True)
-                invalid_ids = ['', 'nan', 'none', '0', '-', 'nan.0', 'null']
-                
-                # Identifikasi Duplikat SEBELUM di-drop
-                mask_valid_sirup = ~df['ID SIRUP'].isin(invalid_ids)
-                dupes = df[mask_valid_sirup & df.duplicated('ID SIRUP', keep=False)].copy()
-                
-                if 'Kode Paket' in df.columns:
-                    df['Kode Paket'] = df['Kode Paket'].astype(str).str.strip()
-                    mask_invalid = df['ID SIRUP'].isin(invalid_ids)
-                    # Prefix missing tetap unik per paket
-                    df['ID SIRUP'] = np.where(mask_invalid, "missing-" + df['Kode Paket'].str.lower(), df['ID SIRUP'])
-                else:
-                    df = df[~df['ID SIRUP'].isin(invalid_ids)]
-                
-                df = df.drop_duplicates('ID SIRUP', keep='last')
-            
-            if 'Kode Paket' in df.columns and 'ID SIRUP' not in df.columns:
-                df['Kode Paket'] = df['Kode Paket'].astype(str).str.strip()
-                
-            return name, df, dupes
-        except:
-            return name, pd.DataFrame(), pd.DataFrame()
-
-    raw, stats, all_dupes = {}, {}, {}
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        results = list(executor.map(lambda x: process_source(*x), urls.items()))
-    
-    for name, df, dupes in results:
-        raw[name], stats[name], all_dupes[name] = df, len(df), dupes
-        
-    return raw, stats, all_dupes
-
-# PART 3: MASTER CONSTRUCTION AND SIDEBAR
-def build_master(raw):
-    d_proc = {}
-    for n in ["Inaproc", "BP2JK", "Iemon"]:
-        df = raw[n].copy()
-        if df.empty or 'ID SIRUP' not in df.columns:
-            d_proc[n] = pd.DataFrame(columns=['ID SIRUP'])
-            continue
-        if n == "BP2JK":
-            p_ribuan = clean_currency_vectorized(df['Pagu RAKL (Rp Ribu)']) * 1000 if 'Pagu RAKL (Rp Ribu)' in df.columns else 0.0
-            df['p_c'] = p_ribuan
-            nk_aw = clean_currency_vectorized(df['Nilai Kontrak']) if 'Nilai Kontrak' in df.columns else 0.0
-            nk_v = clean_currency_vectorized(df['Nilai Kontrak (Rp Ribu)']) * 1000 if 'Nilai Kontrak (Rp Ribu)' in df.columns else 0.0
-            df['nk_c'] = nk_aw.where(nk_aw > 0, nk_v)
-            df['status_norm'] = normalize_status_vectorized(df['Progres Paket'] if 'Progres Paket' in df.columns else (df['Status Kontrak'] if 'Status Kontrak' in df.columns else pd.Series(index=df.index)), source='BP2JK')
-        elif n == "Iemon":
-            df['p_c'] = clean_currency_vectorized(df['Pagu RAKL (Rp Ribu)']) * 1000 if 'Pagu RAKL (Rp Ribu)' in df.columns else 0.0
-            df['nk_c'] = clean_currency_vectorized(df['Nilai Kontrak (Rp Ribu)']) * 1000 if 'Nilai Kontrak (Rp Ribu)' in df.columns else 0.0
-            df['status_norm'] = normalize_status_vectorized(df['Status Kontrak'] if 'Status Kontrak' in df.columns else pd.Series(index=df.index), source='Iemon')
-        elif n == "Inaproc":
-            df['nk_c'] = clean_currency_vectorized(df['Nilai Kontrak'])
-            df['status_norm'] = "Terkontrak"
-        m_ep = df['Metode E-Purchasing'].astype(str).str.upper() if 'Metode E-Purchasing' in df.columns else pd.Series("", index=df.index)
-        m_p = df['Metode Pemilihan'].astype(str).str.upper() if 'Metode Pemilihan' in df.columns else pd.Series("", index=df.index)
-        df['metode_norm'] = np.where(m_ep.str.contains('MINI') | m_p.str.contains('MINI'), "Minikompetisi",
-                            np.where(m_ep.str.contains('NEGOSIASI|SURAT PESANAN|PURCHASING') | m_p.str.contains('NEGOSIASI|SURAT PESANAN|PURCHASING'), "Negosiasi", "Belum Info"))
-        d_proc[n] = df
-
-    all_ids = pd.unique(pd.concat([d_proc[n]['ID SIRUP'] for n in d_proc]))
-    master = pd.DataFrame({'ID SIRUP': all_ids}).set_index('ID SIRUP')
-    map_cols = {'Nama Paket': 'Nama Paket', 'Kode Paket': 'Kode Paket', 'Unor': 'Unor', 'Satker': 'Satker', 'BP2JK': 'BP2JK', 'Jenis Paket': 'Jenis Paket', 'p_c': 'Pagu DIPA', 'nk_c': 'Nilai Kontrak'}
-    
-    for n in ["Iemon", "BP2JK", "Inaproc"]:
-        df = d_proc[n]
-        if df.empty: continue
-        df_to_merge = df.set_index('ID SIRUP')
-        rek_col = next((c for c in ['Rekanan', 'Nama Rekanan'] if c in df_to_merge.columns), None)
-        
-        # Mapping kolom
-        update_dict = {map_cols[c]: df_to_merge[c] for c in map_cols if c in df_to_merge.columns}
-        if rek_col: update_dict['Rekanan'] = df_to_merge[rek_col]
-        
-        for col, data in update_dict.items():
-            if col not in master.columns:
-                master[col] = pd.Series(index=master.index, dtype=data.dtype)
-            
-            if col == 'Pagu DIPA':
-                # JANGAN UPDATE JIKA DATA BARU ADALAH 0 ATAU NAN, ambil yang terbesar
-                current_pagu = master[col].fillna(0)
-                new_pagu = data.reindex(master.index).fillna(0)
-                master[col] = np.maximum(current_pagu, new_pagu)
-            elif col == 'Nilai Kontrak':
-                # Ambil nilai kontrak terbesar (biasanya Inaproc paling update)
-                current_kontrak = master[col].fillna(0)
-                new_kontrak = data.reindex(master.index).fillna(0)
-                master[col] = np.maximum(current_kontrak, new_kontrak)
-            else:
-                # Untuk kolom teks (Nama Paket, Unor, dll), gunakan update standar
-                master[col].update(data)
-        
-        # Penanganan Progres dan Metode secara khusus
-        valid_status = df_to_merge['status_norm'] != "Belum Proses"
-        valid_method = df_to_merge['metode_norm'] != "Belum Info"
-        
-        if 'Progres Paket' not in master.columns: master['Progres Paket'] = pd.Series("Belum Proses", index=master.index, dtype=object)
-        if 'Metode EP' not in master.columns: master['Metode EP'] = pd.Series("Belum Info", index=master.index, dtype=object)
-        
-        if n == "Inaproc":
-            master['Progres Paket'].update(df_to_merge['status_norm'])
-            master['Metode EP'].update(df_to_merge['metode_norm'].where(valid_method))
-        else:
-            master['Progres Paket'].update(df_to_merge['status_norm'].where(valid_status))
-            master['Metode EP'].update(df_to_merge['metode_norm'].where(valid_method))
-
-    master = master.fillna({'Pagu DIPA': 0.0, 'Nilai Kontrak': 0.0, 'Progres Paket': 'Belum Proses', 'Metode EP': 'Belum Info'}).reset_index()
-    
-    # Tambahkan kolom Status Pagu (Flagging Kontrak > Pagu)
-    # Gunakan pembulatan .round(0) agar tidak error karena selisih desimal tipis (di bawah Rp 1)
-    master['Status Pagu'] = np.where(master['Nilai Kontrak'].round(0) > master['Pagu DIPA'].round(0), "❗ MELEBIHI PAGU", "✅ AMAN")
-    # Khusus jika pagu 0 tapi ada kontrak, tandai juga
-    master['Status Pagu'] = np.where((master['Pagu DIPA'] <= 0) & (master['Nilai Kontrak'] > 0), "❗ PAGU KOSONG", master['Status Pagu'])
-    
-    master['In BP2JK'] = master['ID SIRUP'].isin(d_proc['BP2JK']['ID SIRUP'])
-    master['In Iemon'] = master['ID SIRUP'].isin(d_proc['Iemon']['ID SIRUP'])
-    master['In Inaproc'] = master['ID SIRUP'].isin(d_proc['Inaproc']['ID SIRUP'])
-    return master
-
-with st.sidebar:
-    if os.path.exists("image/logo_kemenpu.png"): st.image("image/logo_kemenpu.png", use_container_width=True)
-    st.markdown("---")
-    with st.expander("🌐 Sumber Data"):
-        up_bp, up_ie, up_in = st.file_uploader("BP2JK", type="csv"), st.file_uploader("Iemon", type="csv"), st.file_uploader("Inaproc", type="csv")
-    raw_data, stats, dupes_data = load_and_process_all({"BP2JK": up_bp, "Iemon": up_ie, "Inaproc": up_in})
+def get_data():
+    raw_data, stats, dupes_data = load_and_process_all()
     master_df = build_master(raw_data)
-    menu = st.radio("MENU", ["🚀 Dashboard Utama", "📁 Data BP2JK", "📁 Data Iemon", "📁 Data Inaproc", "🔍 Diagnostik Data"])
+    return raw_data, stats, dupes_data, master_df
 
-if menu == "🚀 Dashboard Utama":
-    st.markdown('<div class="header-container"><div class="header-text"><h1>MONITORING E-PURCHASING TA.2026</h1><p>Konsolidasi Data Nasional (Inaproc) & Sistem Internal Monitoring (BP2JK / Iemon)</p></div></div>', unsafe_allow_html=True)
-    if master_df.empty: st.warning("⚠️ Data kosong.")
-    else:
-        with st.expander("🔍 Filter Global", expanded=True):
-            f1, f2, f3, f4 = st.columns(4)
-            with f1: sel_u = st.multiselect("Filter Unor:", options=sorted(master_df['Unor'].astype(str).unique()))
-            with f2: sel_b = st.multiselect("Filter BP2JK:", options=sorted(master_df['BP2JK'].astype(str).unique()))
-            with f3: sel_j = st.multiselect("Filter Jenis Paket:", options=sorted(master_df['Jenis Paket'].astype(str).unique()))
-            with f4: sel_p = st.multiselect("Filter Progres:", options=['Belum Proses', 'Proses E-Purchasing', 'Persiapan Terkontrak', 'Terkontrak', 'Batal'])
-            f5, f6 = st.columns(2)
-            with f5: sel_m = st.multiselect("Filter Metode:", options=['Negosiasi', 'Minikompetisi', 'Belum Info'])
-            with f6: sel_s = st.multiselect("Filter Skala Paket:", options=['>= 15M', '< 15M', 'Pagu Kosong (Rp 0)'])
+raw_data, stats, dupes_data, master_df = get_data()
 
-        filtered = master_df.copy()
-        filtered['tmp_skala'] = np.where(filtered['Pagu DIPA'] <= 0, 'Pagu Kosong (Rp 0)', np.where(filtered['Pagu DIPA'] >= 15e9, '>= 15M', '< 15M'))
-        if sel_u: filtered = filtered[filtered['Unor'].isin(sel_u)]
-        if sel_b: filtered = filtered[filtered['BP2JK'].isin(sel_b)]
-        if sel_j: filtered = filtered[filtered['Jenis Paket'].isin(sel_j)]
-        if sel_p: filtered = filtered[filtered['Progres Paket'].isin(sel_p)]
-        if sel_m: filtered = filtered[filtered['Metode EP'].isin(sel_m)]
-        if sel_s: filtered = filtered[filtered['tmp_skala'].isin(sel_s)]
+# --- PAGE FUNCTIONS ---
 
-        m1, m2, m3, m4 = st.columns(4)
-        p, k = filtered['Pagu DIPA'].sum(), filtered['Nilai Kontrak'].sum()
-        with m1: st.metric("TOTAL PAGU DIPA", format_idr(p))
-        with m2: st.metric("REALISASI KONTRAK", format_idr(k), delta=f"{(k/p*100 if p>0 else 0):.1f}%")
-        with m3: st.metric("TOTAL PAKET UNIK", f"{len(filtered):,}")
-        with m4: st.metric("PAKET TERKONTRAK", f"{(filtered['Progres Paket']=='Terkontrak').sum():,}")
+def dashboard_page():
+    st.markdown(get_header_html(), unsafe_allow_html=True)
+    
+    # Check and display fallback warnings
+    fallback_warnings = []
+    for src in ["BP2JK", "Iemon", "Inaproc"]:
+        if stats.get(f"{src}_fallback", False):
+            time_str = stats.get(f"{src}_fallback_time", "Tidak diketahui")
+            fallback_warnings.append(f"**{src}** (Terakhir diperbarui: {time_str})")
+            
+    if fallback_warnings:
+        st.warning(f"⚠️ Gagal menarik data terbaru secara online dari Google Sheets. Dashboard saat ini menampilkan data cadangan lokal untuk: {', '.join(fallback_warnings)}.")
+        
+    if master_df.empty: 
+        st.warning("⚠️ Data kosong.")
+        return
 
-        t1, t2 = st.tabs(["📊 ANALISIS VISUAL", "📋 DAFTAR PAKET MASTER"])
-        with t1:
-            c1, c2 = st.columns(2)
-            with c1:
+    # FILTERS
+    with st.expander("🔍 Filter Global", expanded=True):
+        def reset_all_filters():
+            for k in ['f_u', 'f_b', 'f_j', 'f_p', 'f_m', 'f_s', 'f_r']:
+                st.session_state[k] = []
+
+        f1, f2, f3, f4 = st.columns(4)
+        unor_opts = sorted(master_df['Unor'].fillna('Belum Info').unique()) if 'Unor' in master_df.columns else []
+        bp2jk_opts = sorted(master_df['BP2JK'].fillna('Belum Info').unique()) if 'BP2JK' in master_df.columns else []
+        jenis_opts = sorted(master_df['Jenis Paket'].fillna('Belum Info').unique()) if 'Jenis Paket' in master_df.columns else []
+        
+        with f1: sel_u = st.multiselect("Filter Unor:", options=unor_opts, key='f_u')
+        with f2: sel_b = st.multiselect("Filter BP2JK:", options=bp2jk_opts, key='f_b')
+        with f3: sel_j = st.multiselect("Filter Jenis Paket:", options=jenis_opts, key='f_j')
+        with f4: sel_p = st.multiselect("Filter Progres:", options=['Belum Proses', 'Proses E-Purchasing', 'Persiapan Terkontrak', 'Terkontrak', 'Batal'], key='f_p')
+        
+        f5, f6 = st.columns(2)
+        with f5: sel_m = st.multiselect("Filter Metode:", options=['Negosiasi', 'Minikompetisi', 'Belum Info'], key='f_m')
+        skala_opts = ['Pagu Kosong (Rp 0)', '< 200Jt', '200Jt - 2M', '2M - 15M', '15M - 50M', '> 50M']
+        existing_skala = [opt for opt in skala_opts if opt in master_df['Range Pagu'].unique()]
+        with f6: sel_s = st.multiselect("Filter Skala Paket:", options=existing_skala, key='f_s')
+        
+        f7, f8 = st.columns([3, 1])
+        with f7: sel_r = st.multiselect("Filter Realisasi Kontrak:", options=['Ada Kontrak (> Rp 0)', 'Belum Ada Kontrak (Rp 0)', 'Nilai Kontrak > Pagu DIPA'], key='f_r')
+        with f8: 
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.button("🔄 Reset Filter", on_click=reset_all_filters, use_container_width=True)
+
+    # PROCESS FILTERING
+    filtered = master_df.copy()
+    if sel_u: filtered = filtered[filtered['Unor'].fillna('Belum Info').isin(sel_u)]
+    if sel_b: filtered = filtered[filtered['BP2JK'].fillna('Belum Info').isin(sel_b)]
+    if sel_j: filtered = filtered[filtered['Jenis Paket'].fillna('Belum Info').isin(sel_j)]
+    if sel_p: filtered = filtered[filtered['Progres Paket'].isin(sel_p)]
+    if sel_m: filtered = filtered[filtered['Metode EP'].isin(sel_m)]
+    if sel_s: filtered = filtered[filtered['Range Pagu'].isin(sel_s)]
+    
+    if sel_r:
+        mask = pd.Series(False, index=filtered.index)
+        if 'Ada Kontrak (> Rp 0)' in sel_r: mask |= (filtered['Nilai Kontrak'] > 0)
+        if 'Belum Ada Kontrak (Rp 0)' in sel_r: mask |= (filtered['Nilai Kontrak'] <= 0)
+        if 'Nilai Kontrak > Pagu DIPA' in sel_r: mask |= (filtered['Nilai Kontrak'] - filtered['Pagu DIPA'] > 2000000)
+        filtered = filtered[mask]
+
+    # MAIN METRICS
+    m1, m2, m3, m4 = st.columns(4)
+    p, k = filtered['Pagu DIPA'].sum(), filtered['Nilai Kontrak'].sum()
+    pct = (k / p * 100) if p > 0 else 0.0
+
+    card_1_html = f"""<div class="metric-card card-blue">
+<div class="metric-icon-container" style="background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);">
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M21 12V7a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2h-3"/>
+<path d="M3 10h18"/>
+</svg>
+</div>
+<div class="metric-info">
+<span class="metric-label">TOTAL PAGU DIPA</span>
+<div class="metric-value-wrapper">
+<span class="metric-value">{format_idr(p)}</span>
+</div>
+</div>
+</div>"""
+
+    card_2_html = f"""<div class="metric-card card-green">
+<div class="metric-icon-container" style="background: linear-gradient(135deg, #10b981 0%, #047857 100%);">
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<rect x="2" y="7" width="20" height="14" rx="2" ry="2"/>
+<path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>
+</svg>
+</div>
+<div class="metric-info">
+<span class="metric-label">REALISASI KONTRAK</span>
+<div class="metric-value-wrapper">
+<span class="metric-value">{format_idr(k)}</span>
+<span class="metric-delta">↗ {pct:.1f}%</span>
+</div>
+<div class="progress-bar-container">
+<div class="progress-bar-fill" style="width: {min(pct, 100.0):.1f}%;"></div>
+</div>
+</div>
+</div>"""
+
+    card_3_html = f"""<div class="metric-card card-purple">
+<div class="metric-icon-container" style="background: linear-gradient(135deg, #8b5cf6 0%, #6d28d9 100%);">
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<line x1="16.5" y1="9.4" x2="7.5" y2="4.21"/>
+<polygon points="12 22.08 12 12 3 6.92 3 17.08 12 22.08"/>
+<polygon points="12 12 21 6.92 21 17.08 12 22.08"/>
+<polygon points="12 2 3 6.92 12 12 21 6.92 12 2"/>
+<line x1="12" y1="22.08" x2="12" y2="12"/>
+</svg>
+</div>
+<div class="metric-info">
+<span class="metric-label">TOTAL PAKET UNIK</span>
+<div class="metric-value-wrapper">
+<span class="metric-value">{len(filtered):,}</span>
+</div>
+</div>
+</div>"""
+
+    card_4_html = f"""<div class="metric-card card-amber">
+<div class="metric-icon-container" style="background: linear-gradient(135deg, #f59e0b 0%, #b45309 100%);">
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<circle cx="12" cy="8" r="7"/>
+<polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88"/>
+</svg>
+</div>
+<div class="metric-info">
+<span class="metric-label">PAKET TERKONTRAK</span>
+<div class="metric-value-wrapper">
+<span class="metric-value">{(filtered['Progres Paket']=='Terkontrak').sum():,}</span>
+</div>
+</div>
+</div>"""
+
+    with m1: st.markdown(card_1_html, unsafe_allow_html=True)
+    with m2: st.markdown(card_2_html, unsafe_allow_html=True)
+    with m3: st.markdown(card_3_html, unsafe_allow_html=True)
+    with m4: st.markdown(card_4_html, unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-bottom: 0.5rem;'></div>", unsafe_allow_html=True)
+
+    t1, t2, t3 = st.tabs(["📊 ANALISIS VISUAL", "📋 TABEL REKAPAN", f"📋 DAFTAR PAKET MASTER ({len(filtered):,})"])
+    with t1:
+        c1, c2 = st.columns(2)
+        with c1:
+            if not sel_u: st.checkbox("Tampilkan Detail SIBBPI", value=False, key='s_det')
+            with st.container(border=True):
                 st.markdown('<p class="chart-title">Jumlah Paket per Unor</p>', unsafe_allow_html=True)
                 det = True if sel_u else st.session_state.get('s_det', False)
+                
+                # Dinamis Height
+                h_u = 700 if det else 450
+                
                 sib = ['SEKJEN', 'ITJEN', 'BK', 'BPIW', 'BPSDM', 'PI']
-                u_c = filtered['Unor'].apply(lambda x: "SIBBPI" if not det and str(x).upper() in sib else x).value_counts().reset_index()
+                u_vals = filtered['Unor'].fillna('Belum Info').apply(lambda x: "SIBBPI" if not det and str(x).upper() in sib else x)
+                u_c = u_vals.value_counts().reset_index()
                 u_c.columns = ['U', 'V']
-                h = 700 if det else 450
-                fig_u = px.pie(u_c, values='V', names='U', height=h, hole=0.5, color_discrete_sequence=px.colors.qualitative.Bold)
+                
+                pupr_pie_colors = ['#1e3a8a', '#FFCC00', '#0f766e', '#06b6d4', '#64748b', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899']
+                fig_u = px.pie(u_c, values='V', names='U', height=h_u, hole=0.5, color_discrete_sequence=pupr_pie_colors)
                 fig_u.update_traces(texttemplate='%{value}<br>%{percent:.1%}', textposition='auto')
-                if det: fig_u.update_traces(domain=dict(x=[0.3, 0.9], y=[0.2, 0.8]))
-                fig_u.update_layout(legend=dict(orientation="v", y=1, x=0), annotations=[dict(text=f"<b>{len(filtered)}</b>", x=0.6 if det else 0.5, y=0.5, showarrow=False, font_size=32)])
+                
+                # Penyesuaian Layout jika Detail Aktif
+                if det:
+                    fig_u.update_traces(domain=dict(x=[0.2, 0.8], y=[0.2, 0.8]))
+                
+                fig_u.update_layout(
+                    legend=dict(orientation="v", y=1, x=0), 
+                    annotations=[dict(text=f"<b>{len(filtered)}</b>", x=0.5, y=0.5, showarrow=False, font_size=32)], 
+                    margin=dict(t=0, b=0, l=0, r=0),
+                    font_family="Inter, sans-serif"
+                )
                 st.plotly_chart(fig_u, use_container_width=True)
-                if not sel_u: st.checkbox("Tampilkan Detail SIBBPI", value=False, key='s_det')
-            with c2:
+                
+        with c2:
+            st.checkbox("Tampilkan Detail Progres", value=False, key='p_det')
+            with st.container(border=True):
                 st.markdown('<p class="chart-title">Progres Tahapan</p>', unsafe_allow_html=True)
-                p_c = filtered['Progres Paket'].value_counts().reset_index()
-                fig_p = px.pie(p_c, values='count', names='Progres Paket', height=h, color='Progres Paket', color_discrete_map={'Terkontrak':'#22c55e','Batal':'#ef4444','Belum Proses':'#94a3b8'})
+
+                is_detailed = st.session_state.get('p_det', False)
+                
+                # Dinamis Height
+                h_p = 700 if is_detailed else 450
+                
+                p_col = 'Progres Raw' if is_detailed else 'Progres Paket'
+                p_vals = filtered[p_col].copy()
+                
+                terkontrak_variants = ['Selesai', 'SELESAI KONTRAK', 'Selesai Kontrak', 'Terkontrak (Nasional)', 'TERKONTRAK', 'SELESAI']
+                p_vals = p_vals.replace(terkontrak_variants, 'Terkontrak')
+                
+                p_c = p_vals.value_counts().reset_index()
+                p_c.columns = ['Status', 'count']
+
+                color_map = {
+                    'Terkontrak': '#1e3a8a',
+                    'Proses E-Purchasing': '#FFCC00',
+                    'Persiapan Terkontrak': '#0f766e',
+                    'Belum Proses': '#64748b',
+                    'Batal': '#b91c1c'
+                }
+                
+                fig_p = px.pie(p_c, values='count', names='Status', height=h_p, color='Status', 
+                               color_discrete_map=color_map)
+                
                 fig_p.update_traces(texttemplate='%{value} (%{percent:.1%})', textposition='auto')
-                if det: fig_p.update_traces(domain=dict(x=[0.3, 0.9], y=[0.2, 0.8]))
-                fig_p.update_layout(legend=dict(orientation="v", y=1, x=0))
+                
+                # Penyesuaian Layout jika Detail Aktif
+                if is_detailed:
+                    fig_p.update_traces(domain=dict(x=[0.2, 0.8], y=[0.2, 0.8]))
+                
+                fig_p.update_layout(legend=dict(orientation="v", y=1, x=0), margin=dict(t=0, b=0, l=0, r=0), font_family="Inter, sans-serif")
                 st.plotly_chart(fig_p, use_container_width=True)
-            st.markdown("---")
-            c3, c4 = st.columns(2)
-            with c3:
+
+        c3, c4 = st.columns(2)
+        with c3:
+            with st.container(border=True):
                 st.markdown('<p class="chart-title">Distribusi Jenis Paket</p>', unsafe_allow_html=True)
                 j_c = filtered['Jenis Paket'].value_counts().reset_index()
-                st.plotly_chart(px.bar(j_c, x='Jenis Paket', y='count', color='Jenis Paket', text_auto=True, height=400), use_container_width=True)
-            with c4:
+                jenis_color_map = {
+                    'BARANG': '#1e3a8a',
+                    'PEKERJAAN KONSTRUKSI': '#FFCC00',
+                    'JASA KONSULTASI': '#0f766e',
+                    'JASA LAINNYA': '#06b6d4',
+                    'AU': '#64748b',
+                    'Belum Info': '#cbd5e1'
+                }
+                fig_j = px.bar(j_c, x='Jenis Paket', y='count', color='Jenis Paket', text_auto=True, height=400, color_discrete_map=jenis_color_map)
+                fig_j.update_layout(showlegend=False, font_family="Inter, sans-serif")
+                st.plotly_chart(fig_j, use_container_width=True)
+        with c4:
+            with st.container(border=True):
                 st.markdown('<p class="chart-title">Metode E-Purchasing</p>', unsafe_allow_html=True)
                 m_c = filtered['Metode EP'].value_counts().reset_index()
-                st.plotly_chart(px.treemap(m_c, path=[px.Constant("Total"), 'Metode EP'], values='count', color='Metode EP', color_discrete_map={'Negosiasi':'#6366f1','Minikompetisi':'#ec4899','Belum Info':'#94a3b8'}, height=400), use_container_width=True)
-            st.markdown("---")
+                fig_m = px.treemap(m_c, path=[px.Constant("Total"), 'Metode EP'], values='count', color='Metode EP', height=400,
+                                   color_discrete_sequence=['#1e3a8a', '#FFCC00', '#0f766e', '#06b6d4', '#64748b', '#3b82f6'])
+                fig_m.update_layout(font_family="Inter, sans-serif")
+                st.plotly_chart(fig_m, use_container_width=True)
+
+        # --- RESTORED MISSING CHARTS ---
+        with st.container(border=True):
             all_b = st.checkbox("Tampilkan Semua BP2JK", value=False)
             st.markdown('<p class="chart-title">Jumlah Paket per BP2JK</p>', unsafe_allow_html=True)
             b_c = filtered['BP2JK'].value_counts().reset_index()
             disp_b = b_c if all_b else b_c.head(10)
-            fig_b = px.bar(disp_b, x='count', y='BP2JK', orientation='h', color='count', color_continuous_scale='Blues', text_auto=True)
+            fig_b = px.bar(disp_b, x='count', y='BP2JK', orientation='h', color='count', color_continuous_scale=['#cbd5e1', '#1e3a8a'], text_auto=True)
             fig_b.update_traces(textangle=0, textposition='outside')
-            fig_b.update_layout(yaxis={'categoryorder':'total ascending'}, showlegend=False, height=max(400, len(disp_b)*30))
+            fig_b.update_layout(yaxis={'categoryorder':'total ascending'}, showlegend=False, height=max(400, len(disp_b)*30), margin=dict(t=10, b=10, l=10, r=10), font_family="Inter, sans-serif")
             st.plotly_chart(fig_b, use_container_width=True)
 
-        with t2:
-            dv = filtered.copy()
-            # Bersihkan ID SIRUP internal untuk tampilan (tampilkan kosong jika missing-)
-            mask_missing = dv['ID SIRUP'].str.contains('missing-', na=False)
-            dv.loc[mask_missing, 'ID SIRUP'] = "" 
-            
-            # Tombol Download Excel
-            import io
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                dv.to_excel(writer, index=False, sheet_name='Data_Master_EP')
-            
-            st.download_button(
-                label="📥 Download Data Master (Excel)",
-                data=buffer.getvalue(),
-                file_name=f"Master_E-Purchasing_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        with st.container(border=True):
+            st.markdown('<p class="chart-title">Distribusi Skala Nilai Paket (Pagu DIPA)</p>', unsafe_allow_html=True)
+            r_c = filtered['Range Pagu'].value_counts().reset_index()
+            r_c.columns = ['Range Pagu', 'count']
+            logic_order = ['Pagu Kosong (Rp 0)', '< 200Jt', '200Jt - 2M', '2M - 15M', '15M - 50M', '> 50M']
+            existing_order = [o for o in logic_order if o in r_c['Range Pagu'].values]
+            range_color_map = {
+                'Pagu Kosong (Rp 0)': '#64748b',
+                '< 200Jt': '#94a3b8',
+                '200Jt - 2M': '#06b6d4',
+                '2M - 15M': '#3b82f6',
+                '15M - 50M': '#1e3a8a',
+                '> 50M': '#FFCC00'
+            }
+            fig_r = px.bar(r_c, x='Range Pagu', y='count', color='Range Pagu', text_auto=True, height=400, color_discrete_map=range_color_map, category_orders={'Range Pagu': existing_order})
+            fig_r.update_layout(showlegend=False, font_family="Inter, sans-serif")
+            st.plotly_chart(fig_r, use_container_width=True)
 
-            dv['Pagu DIPA'] = dv['Pagu DIPA'].apply(format_idr)
-            dv['Nilai Kontrak'] = dv['Nilai Kontrak'].apply(format_idr)
-            dv.insert(0, 'No.', range(1, len(dv)+1))
-            st.dataframe(dv[['No.', 'ID SIRUP', 'Nama Paket', 'Unor', 'Progres Paket', 'Status Pagu', 'Metode EP', 'Pagu DIPA', 'Nilai Kontrak', 'Rekanan']], use_container_width=True, height=600, hide_index=True)
+    with t2:
+        # Exclude Batal packages from statistics in Rekapan Tab
+        df_rek = filtered[filtered['Progres Paket'] != 'Batal']
+        
+        rows_u, prog_u = generate_rekap_table(df_rek, 'Unor')
+        if rows_u:
+            st.markdown(render_rekap_html(rows_u, prog_u, "REKAP PAKET E-PURCHASING PER UNOR TA. 2026", "Unor"), unsafe_allow_html=True)
+        else:
+            st.info("Tidak ada data Unor yang sesuai dengan filter.")
 
-elif menu == "🔍 Diagnostik Data":
+        rows_j, prog_j = generate_rekap_table(df_rek, 'Jenis Paket')
+        if rows_j:
+            st.markdown(render_rekap_html(rows_j, prog_j, "REKAP PAKET E-PURCHASING PER JENIS PAKET TA. 2026", "Jenis Paket"), unsafe_allow_html=True)
+        else:
+            st.info("Tidak ada data Jenis Paket yang sesuai dengan filter.")
+
+        rows_b, prog_b = generate_rekap_table(df_rek, 'BP2JK')
+        if rows_b:
+            st.markdown(render_rekap_html(rows_b, prog_b, "REKAP PAKET E-PURCHASING PER BALAI TA. 2026", "BP2JK Wilayah"), unsafe_allow_html=True)
+        else:
+            st.info("Tidak ada data BP2JK yang sesuai dengan filter.")
+
+    with t3:
+        st.markdown("### 🔍 Cari Paket")
+        search_query = st.text_input("Masukkan Nama Paket atau ID SIRUP:", placeholder="Cari...", key="search_master")
+        dv = filtered.copy()
+        if search_query:
+            dv = dv[dv['Nama Paket'].astype(str).str.contains(search_query, case=False, na=False) | dv['ID SIRUP'].astype(str).str.contains(search_query, case=False, na=False)]
+        
+        dv['Pagu DIPA'] = dv['Pagu DIPA'].apply(format_idr)
+        dv['Nilai Kontrak'] = dv['Nilai Kontrak'].apply(format_idr)
+        st.dataframe(dv[['ID SIRUP', 'Nama Paket', 'Unor', 'BP2JK', 'Progres Paket', 'Jenis Paket', 'Status Pagu', 'Pagu DIPA', 'Nilai Kontrak']], use_container_width=True, height=800, hide_index=True)
+
+def diagnostic_page():
     st.title("🔍 Diagnostik Sinkronisasi")
+    if master_df.empty:
+        st.warning("⚠️ Data kosong. Tidak dapat melakukan diagnostik sinkronisasi.")
+        return
+        
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("BP2JK", stats['BP2JK']); c2.metric("Iemon", stats['Iemon']); c3.metric("Inaproc", stats['Inaproc']); c4.metric("TOTAL MASTER", len(master_df))
-    gb, gi = master_df[~master_df['In BP2JK']].copy(), master_df[~master_df['In Iemon']].copy()
-    gn = master_df[master_df['In Inaproc'] & (~master_df['In BP2JK'] | ~master_df['In Iemon'])].copy()
-    gs = master_df[master_df['ID SIRUP'].str.contains('MISSING-', na=False)].copy()
-    tg1, tg2, tg3, tg4, tg5 = st.tabs([f"❌ Belum Masuk BP2JK ({len(gb)})", f"❌ Belum Masuk Iemon ({len(gi)})", f"🌐 Gap Inaproc ({len(gn)})", f"⚠️ Perlu Perbaikan SIRUP ({len(gs)})", "⚠️ Data Duplikat"])
-    with tg1: gb.insert(0,'No.',range(1,len(gb)+1)); st.dataframe(gb[['No.','ID SIRUP','Nama Paket','Unor','Satker']], use_container_width=True, hide_index=True)
-    with tg2: gi.insert(0,'No.',range(1,len(gi)+1)); st.dataframe(gi[['No.','ID SIRUP','Nama Paket','Unor','Satker']], use_container_width=True, hide_index=True)
-    with tg3: gn.insert(0,'No.',range(1,len(gn)+1)); st.dataframe(gn[['No.','ID SIRUP','Nama Paket','Unor','In Inaproc','In BP2JK','In Iemon']], use_container_width=True, hide_index=True)
-    with tg4: 
-        st.warning("Daftar paket di bawah ini tidak memiliki ID SIRUP yang valid di data internal (BP2JK/Iemon). Paket ini TIDAK AKAN bisa sinkron dengan data Inaproc sampai ID SIRUP diperbaiki.")
-        gs_display = gs.copy()
-        gs_display.loc[gs_display['ID SIRUP'].str.contains('MISSING-', na=False), 'ID SIRUP'] = "MISSING"
-        gs_display.insert(0,'No.',range(1,len(gs_display)+1))
-        st.dataframe(gs_display[['No.','ID SIRUP','Kode Paket','Nama Paket','Unor','Satker']], use_container_width=True, hide_index=True)
-    with tg5:
-        st.info("Data duplikat terdeteksi jika satu ID SIRUP digunakan oleh lebih dari satu paket dalam satu sumber data yang sama.")
+    
+    gs = master_df[master_df['ID SIRUP'].str.contains('missing-', case=False, na=False)].copy()
+    ina_only = master_df[master_df['In Inaproc'] & ~master_df['In BP2JK'] & ~master_df['In Iemon']].copy()
+    ie_only = master_df[master_df['In Iemon'] & ~master_df['In BP2JK'] & ~master_df['In Inaproc']].copy()
+    bp_only = master_df[master_df['In BP2JK'] & ~master_df['In Iemon'] & ~master_df['In Inaproc']].copy()
+    
+    mask_internal = (master_df['In BP2JK'] | master_df['In Iemon'])
+    mask_not_contracted_internal = ~master_df['Progres Paket'].isin(['Terkontrak', 'Persiapan Terkontrak'])
+    gap_kontrak = master_df[mask_internal & mask_not_contracted_internal & master_df['In Inaproc']].copy()
+
+    df_dupe_name = master_df.copy()
+    df_dupe_name['name_norm'] = df_dupe_name['Nama Paket'].astype(str).str.lower().str.replace(r'[^a-z0-9]', '', regex=True).str.strip()
+    
+    # Vectorized check: check if a group has both at least one valid and one missing SIRUP ID
+    is_missing = df_dupe_name['ID SIRUP'].str.contains('missing-|unknown-|unk-|^$', case=False, na=False)
+    is_valid = ~is_missing
+    
+    has_valid_in_group = is_valid.groupby(df_dupe_name['name_norm']).transform('any')
+    has_missing_in_group = is_missing.groupby(df_dupe_name['name_norm']).transform('any')
+    
+    dupe_groups = df_dupe_name[has_valid_in_group & has_missing_in_group]
+
+    tg1, tg2, tgie, tgbp, tg3, tg4, tg5 = st.tabs([
+        f"⚠️ Perlu Perbaikan SIRUP ({len(gs)})", 
+        f"🌐 Inaproc Saja ({len(ina_only)})",
+        f"📁 Iemon Saja ({len(ie_only)})",
+        f"📁 BP2JK Saja ({len(bp_only)})",
+        f"📑 Gap Status Kontrak ({len(gap_kontrak)})",
+        "⚠️ Data Duplikat", 
+        "🔍 Potensi Duplikat (Nama)"
+    ])
+    
+    with tg1:
+        st.warning("Paket tanpa ID SIRUP valid di internal. Tidak akan sinkron dengan Inaproc.")
+        st.dataframe(gs[['ID SIRUP', 'Kode Paket', 'Nama Paket', 'Unor', 'Satker']], use_container_width=True, height=600, hide_index=True)
+
+    with tg2:
+        st.info("Hanya ada di Inaproc (Nasional), belum ada di data internal.")
+        st.dataframe(ina_only[['ID SIRUP', 'Nama Paket', 'Unor', 'Satker', 'Nilai Kontrak', 'Rekanan']], use_container_width=True, height=600, hide_index=True)
+
+    with tgie:
+        st.info("Hanya ada di data Iemon.")
+        st.dataframe(ie_only[['ID SIRUP', 'Kode Paket', 'Nama Paket', 'Unor', 'Satker', 'Pagu DIPA']], use_container_width=True, height=600, hide_index=True)
+
+    with tgbp:
+        st.info("Hanya ada di data BP2JK.")
+        st.dataframe(bp_only[['ID SIRUP', 'Kode Paket', 'Nama Paket', 'Unor', 'Satker', 'Pagu DIPA']], use_container_width=True, height=600, hide_index=True)
+
+    with tg3:
+        st.info("Sudah berkontrak di Inaproc, tapi status internal belum 'Terkontrak'.")
+        st.dataframe(gap_kontrak[['ID SIRUP', 'Nama Paket', 'Unor', 'Progres Paket', 'Nilai Kontrak']], use_container_width=True, height=600, hide_index=True)
+    
+    with tg4:
         for src in ["BP2JK", "Iemon", "Inaproc"]:
             d_df = dupes_data.get(src, pd.DataFrame())
-            if not d_df.empty:
-                st.subheader(f"Duplikat di {src} ({len(d_df)} baris)")
-                d_df.insert(0, 'No.', range(1, len(d_df)+1))
-                st.dataframe(d_df, use_container_width=True, hide_index=True)
-            else:
-                st.success(f"✅ Tidak ada duplikat di {src}")
+            st.subheader(f"{src} ({len(d_df)} Duplikat)")
+            if not d_df.empty: st.dataframe(d_df, use_container_width=True, height=400, hide_index=True)
+            else: st.success(f"✅ Bersih di {src}")
 
-else:
-    src_n = menu.split(" ")[2]
-    st.title(f"📄 Detail Data {src_n}")
-    df_r = raw_data.get(src_n).copy()
+    with tg5:
+        st.info("Indikasi paket yang sama tapi terpisah (satu punya SIRUP, satu MISSING).")
+        if not dupe_groups.empty:
+            res_dupe = dupe_groups.sort_values(['name_norm', 'ID SIRUP'])
+            st.dataframe(res_dupe[['Nama Paket', 'ID SIRUP', 'Kode Paket', 'Unor', 'Satker', 'Pagu DIPA']], use_container_width=True, height=600, hide_index=True)
+        else:
+            st.success("✅ Tidak ditemukan potensi duplikat nama.")
+
+def detail_data_page(source_name):
+    st.title(f"📄 Detail Data {source_name}")
+    df_r = raw_data.get(source_name).copy()
     if not df_r.empty:
-        df_r.insert(0, 'No.', range(1, len(df_r)+1))
-        st.dataframe(df_r, use_container_width=True, height=600, hide_index=True)
+        st.dataframe(df_r, use_container_width=True, height=800, hide_index=True)
+    else:
+        st.warning("Data tidak tersedia.")
+
+# --- NAMED FUNCTIONS FOR NAVIGATION (Fixes <lambda> error) ---
+def bp2jk_page(): detail_data_page("BP2JK")
+def iemon_page(): detail_data_page("Iemon")
+def inaproc_page(): detail_data_page("Inaproc")
+
+# --- NAVIGATION CONFIG ---
+pg = st.navigation({
+    "UTAMA": [
+        st.Page(dashboard_page, title="Dashboard Utama", icon="🚀", default=True),
+        st.Page(diagnostic_page, title="Diagnostik Data", icon="🔍"),
+    ],
+    "SUMBER DATA": [
+        st.Page(bp2jk_page, title="Data BP2JK", icon="📁"),
+        st.Page(iemon_page, title="Data Iemon", icon="📁"),
+        st.Page(inaproc_page, title="Data Inaproc", icon="🌐"),
+    ]
+})
+
+# --- SIDEBAR GLOBAL ELEMENTS ---
+with st.sidebar:
+    st.markdown('<div class="sidebar-top-container">', unsafe_allow_html=True)
+    if os.path.exists("image/logo_kemenpu.png"): 
+        st.image("image/logo_kemenpu.png", use_container_width=True)
+    st.markdown('<div class="sidebar-header-text"><h3>SUBDIT KATALOG</h3><p>Dit. Pengadaan Jasa Konstruksi</p></div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # "New Chat" Style Button (Update Data)
+    if st.button("🔄 UPDATE DATA"):
+        st.cache_data.clear()
+        st.rerun()
+
+# RUN NAVIGATION
+pg.run()
 
 st.markdown("---")
 st.markdown("<center style='color: #94a3b8;'>Monitoring E-Purchasing TA.2026 | Subdit Katalog</center>", unsafe_allow_html=True)
